@@ -1,0 +1,53 @@
+# CI do HyperFrame: typecheck, testes e build do frontend em jobs paralelos.
+# Roda em pull requests e em push na main. Não gera o bundle nativo do Tauri
+# (isso fica no release.yml), só o bundle Vite do app.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# um run por ref; um push novo cancela o anterior
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: 24
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: typecheck engine
+            run: npm run typecheck -w @hyperframe/engine
+          - name: typecheck desktop
+            run: npm run typecheck -w @hyperframe/desktop
+          - name: testes engine
+            run: npm test -w @hyperframe/engine
+          # só o vite build: o tsc já roda no job "typecheck desktop"
+          - name: build desktop (vite)
+            run: npm exec -w @hyperframe/desktop -- vite build
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci --no-audit --no-fund
+
+      - run: ${{ matrix.run }}
