@@ -2,16 +2,19 @@
 // Planejamento do CI: descobre os workspaces do monorepo, vê quais mudaram
 // (mais os dependentes deles) e gera a matrix de jobs do workflow ci.yml.
 //
-// Só usa módulos nativos do Node (24+: fs.globSync e path.matchesGlob). Uso local:
+// Os arquivos alterados vêm da API REST do GitHub (o checkout do job é raso,
+// sem histórico). Só usa módulos nativos do Node (24+: fetch, fs.globSync,
+// path.matchesGlob). Uso local:
 //   node .github/scripts/ci-plan.mjs --all
-//   node .github/scripts/ci-plan.mjs --base origin/main --head HEAD --merge-base
-//   node .github/scripts/ci-plan.mjs --files lista.txt     (um caminho por linha; "-" = stdin)
-// Sem argumentos, lê o evento do GitHub Actions (GITHUB_EVENT_NAME/GITHUB_EVENT_PATH).
+//   git diff --name-only origin/main...HEAD | node .github/scripts/ci-plan.mjs --files -
+//   CHANGED_FILES=$'a.ts\nb.ts' node .github/scripts/ci-plan.mjs
+// Sem lista, lê o evento do Actions (GITHUB_EVENT_NAME/GITHUB_EVENT_PATH,
+// GITHUB_REPOSITORY, GITHUB_API_URL, GITHUB_TOKEN). Apontar GITHUB_API_URL para
+// um servidor local permite testar paginação e truncamento sem rede.
 //
 // Saída: a matrix em JSON no stdout e um resumo no stderr. No Actions também
 // escreve `matrix` e `empty` em $GITHUB_OUTPUT e o resumo em $GITHUB_STEP_SUMMARY.
 
-import { execFileSync } from 'node:child_process';
 import { appendFileSync, globSync, readFileSync } from 'node:fs';
 import { matchesGlob, posix } from 'node:path';
 import { parseArgs } from 'node:util';
@@ -29,16 +32,64 @@ const IGNORED = ['**/*.md', 'LICENSE', 'site/**', 'design/**'];
 const DEP_FIELDS = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'];
 const ZERO_SHA = /^0+$/;
 
+// limites documentados da API: PR files lista no máximo 3000 arquivos,
+// compare no máximo 300
+const PR_FILES_MAX = 3000;
+const COMPARE_FILES_MAX = 300;
+
 const readJson = (file) => JSON.parse(readFileSync(file, 'utf8'));
 const log = (msg) => process.stderr.write(`${msg}\n`);
-// GIT_NO_LAZY_FETCH: no clone parcial, um SHA ausente falha na hora em vez de
-// tentar buscar no remoto (o checkout roda com persist-credentials: false)
-const git = (...args) =>
-  execFileSync('git', args, {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, GIT_NO_LAZY_FETCH: '1' },
-  });
+
+class ApiError extends Error {}
+
+// GET na API com uma nova tentativa em erro de rede ou 5xx
+async function api(path) {
+  const base = (process.env.GITHUB_API_URL || 'https://api.github.com').replace(/\/+$/, '');
+  const headers = { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' };
+  if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  let last;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch(`${base}${path}`, { headers, signal: AbortSignal.timeout(30_000) });
+      if (res.ok) return await res.json();
+      last = `HTTP ${res.status} em ${path}`;
+      if (res.status < 500) break;
+    } catch (err) {
+      last = `${err.name}: ${err.message} em ${path}`;
+    }
+  }
+  throw new ApiError(last);
+}
+
+const namesOf = (files) => files.flatMap((f) => [f.filename, f.previous_filename].filter(Boolean));
+
+async function prFiles(repo, pr) {
+  const files = [];
+  for (let page = 1; page <= PR_FILES_MAX / 100; page++) {
+    const batch = await api(`/repos/${repo}/pulls/${pr.number}/files?per_page=100&page=${page}`);
+    files.push(...batch);
+    if (batch.length < 100) break;
+  }
+  const expected = pr.changed_files;
+  if (files.length >= PR_FILES_MAX || (Number.isInteger(expected) && files.length < expected)) {
+    return { files: null, warn: `PR com ${expected ?? '?'} arquivos, a API listou ${files.length}` };
+  }
+  return { files: namesOf(files) };
+}
+
+async function pushFiles(repo, before, after) {
+  // per_page=1: a lista de arquivos vem inteira na primeira página; só os commits paginam
+  const cmp = await api(`/repos/${repo}/compare/${before}...${after}?per_page=1`);
+  // diverged/behind = force-push: o compare seria contra o merge-base, não contra o before
+  if (cmp.status !== 'ahead' && cmp.status !== 'identical') {
+    return { files: null, warn: `compare ${before}...${after} com status "${cmp.status}"` };
+  }
+  const files = cmp.files ?? [];
+  if (files.length >= COMPARE_FILES_MAX) {
+    return { files: null, warn: `compare com ${files.length} arquivos (limite da API é ${COMPARE_FILES_MAX})` };
+  }
+  return { files: namesOf(files) };
+}
 
 function discoverWorkspaces() {
   const root = readJson('package.json');
@@ -60,44 +111,35 @@ function discoverWorkspaces() {
 }
 
 // Lista de arquivos alterados, ou null quando não dá para saber (=> roda tudo).
-function changedFiles(opts) {
+async function changedFiles(opts) {
   if (opts.all) return { files: null, reason: '--all' };
-  if (opts.files) {
-    const text = readFileSync(opts.files === '-' ? 0 : opts.files, 'utf8');
-    return { files: text.split('\n').map((l) => l.trim()).filter(Boolean), reason: `lista ${opts.files}` };
-  }
+  const fromList = (text, reason) => ({ files: text.split('\n').map((l) => l.trim()).filter(Boolean), reason });
+  if (opts.files) return fromList(readFileSync(opts.files === '-' ? 0 : opts.files, 'utf8'), `lista ${opts.files}`);
+  if (process.env.CHANGED_FILES !== undefined) return fromList(process.env.CHANGED_FILES, 'CHANGED_FILES');
 
-  let base = opts.base;
-  let head = opts.head ?? 'HEAD';
-  let mergeBase = opts['merge-base'];
-  if (!base) {
-    const event = process.env.GITHUB_EVENT_NAME;
-    const payload = process.env.GITHUB_EVENT_PATH ? readJson(process.env.GITHUB_EVENT_PATH) : {};
-    head = process.env.GITHUB_SHA || head;
-    if (event === 'pull_request') {
-      base = payload.pull_request?.base?.sha;
-      mergeBase = true;
+  const event = process.env.GITHUB_EVENT_NAME;
+  const payload = process.env.GITHUB_EVENT_PATH ? readJson(process.env.GITHUB_EVENT_PATH) : {};
+  const repo = process.env.GITHUB_REPOSITORY;
+  let result;
+  try {
+    if (!repo) throw new ApiError('GITHUB_REPOSITORY não definido');
+    if (event === 'pull_request' && payload.pull_request?.number) {
+      result = await prFiles(repo, payload.pull_request);
+      result.reason = `API: arquivos do PR #${payload.pull_request.number}`;
     } else if (event === 'push') {
-      base = payload.before;
-      mergeBase = false;
+      const { before, after = process.env.GITHUB_SHA } = payload;
+      if (!before || ZERO_SHA.test(before)) return { files: null, reason: 'push sem commit base' };
+      result = await pushFiles(repo, before, after);
+      result.reason = `API: compare ${before.slice(0, 12)}...${String(after).slice(0, 12)}`;
     } else {
       return { files: null, reason: `evento ${event ?? 'desconhecido'}` };
     }
-    if (!base || ZERO_SHA.test(base)) return { files: null, reason: `${event} sem commit base` };
-  }
-
-  const range = mergeBase ? `${base}...${head}` : `${base}..${head}`;
-  try {
-    // --no-renames: arquivo movido aparece no caminho antigo e no novo
-    // (e não precisa baixar blobs no clone com filter=blob:none).
-    const out = git('diff', '--name-only', '--no-renames', '-z', range, '--');
-    return { files: out.split('\0').filter(Boolean), reason: `git diff ${range}` };
   } catch (err) {
-    // base inalcançável (force-push, histórico raso...): melhor rodar tudo
-    const detail = String(err.stderr || err.message).trim().split('\n').at(-1);
-    log(`::warning::não foi possível calcular o diff ${range} (${detail}); rodando todos os workspaces`);
-    return { files: null, reason: `diff ${range} falhou` };
+    if (!(err instanceof ApiError)) throw err;
+    result = { files: null, warn: err.message, reason: 'API falhou' };
   }
+  if (result.warn) log(`::warning::${result.warn}; rodando todos os workspaces`);
+  return result;
 }
 
 function plan(workspaces, files) {
@@ -150,14 +192,11 @@ const { values: opts } = parseArgs({
   options: {
     all: { type: 'boolean' },
     files: { type: 'string' },
-    base: { type: 'string' },
-    head: { type: 'string' },
-    'merge-base': { type: 'boolean' },
   },
 });
 
 const workspaces = discoverWorkspaces();
-const { files, reason } = changedFiles(opts);
+const { files, reason } = await changedFiles(opts);
 const { include, why, shared } = plan(workspaces, files);
 
 const lines = [`origem: ${reason}${files ? ` (${files.length} arquivo(s))` : ' => todos'}`];

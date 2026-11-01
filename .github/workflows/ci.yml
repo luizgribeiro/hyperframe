@@ -30,26 +30,34 @@ jobs:
     name: plan
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read # lista de arquivos do PR (necessário em repo privado)
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       empty: ${{ steps.plan.outputs.empty }}
     steps:
-      # histórico completo para o diff (merge-base no PR, before..sha no push),
-      # mas sem blobs: o diff --name-only só precisa das árvores
+      # checkout raso e esparso: só o script e os package.json (raiz e workspaces);
+      # os arquivos alterados vêm da API do GitHub, não do histórico do git
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 0
-          filter: blob:none
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            package.json
+            /.github/scripts/
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
 
-      # lê o evento de $GITHUB_EVENT_PATH; push sem "before" e workflow_dispatch rodam tudo
+      # pull_request: /pulls/{n}/files; push: /compare/{before}...{after};
+      # workflow_dispatch, push sem "before" ou resposta truncada/erro da API: roda tudo
       - id: plan
         run: node .github/scripts/ci-plan.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
   check:
     name: ${{ matrix.task }} ${{ matrix.workspace }}
